@@ -427,10 +427,48 @@
     return { indices, opts: o };
   }
 
+  // ---------- 补帧：逐帧延迟生成器（避免一次性阻塞主线程）----------
+  // 与 interpolateFrames 等价，但用 generator 逐张产出中间帧，调用方可 await/yield。
+  function* interpolateFramesLazy(frames, opts) {
+    opts = opts || {};
+    const n = frames.length;
+    if (n < 2) { for (const f of frames) yield f; return; }
+    const method = opts.method || "linear";
+    const ref = analyzeSizes(frames).refIndex;
+    const aligned = alignToReference(frames, ref);
+    const between = (fa, fb, t) => {
+      if (method === "optical") return opticalFlowWarp(fa, fb, t, { block: 8, radius: 8 });
+      if (method === "ai") return opticalFlowWarp(fa, fb, t, { block: 4, radius: 12 });
+      return blendFrames(fa, fb, t);
+    };
+    if (opts.mode === "target") {
+      const T = clamp(int(opts.target), n + 1, 600);
+      for (let p = 0; p < T; p++) {
+        const pos = (p * (n - 1)) / (T - 1);
+        const li = Math.floor(pos), ri = Math.min(n - 1, li + 1), t = pos - li;
+        yield t <= 0 ? aligned[li] : between(aligned[li], aligned[ri], t);
+      }
+    } else {
+      const mult = clamp(int(opts.mult), 2, 16);
+      const k = mult - 1;
+      for (let i = 0; i < n; i++) {
+        yield aligned[i];
+        if (i < n - 1) for (let j = 1; j <= k; j++) yield between(aligned[i], aligned[i + 1], j / (k + 1));
+      }
+    }
+  }
+
+  // ---------- 调色板量化（Promise 化，逐帧分块）----------
+  // 把单帧量化做成可 await 的形式，便于在主循环里按时间预算 yield。
+  // 这里直接同步计算，但返回 Promise，由调用方用"每帧后让出事件循环"来分摊开销。
+  function quantizeFrameAsync(rgba, w, h, maxColors) {
+    return Promise.resolve(quantizeFrame(rgba, w, h, maxColors));
+  }
+
   return {
     clamp, int, Img, pixelate, sliceGrid, sliceTransparent, autoDetectGrid,
     removeBackground, fitFrameTo, analyzeSizes, alignToReference,
-    blendFrames, opticalFlowWarp, interpolateFrames,
-    medianCut, quantizeFrame,
+    blendFrames, opticalFlowWarp, interpolateFrames, interpolateFramesLazy,
+    medianCut, quantizeFrame, quantizeFrameAsync,
   };
 });

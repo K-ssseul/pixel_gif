@@ -321,14 +321,32 @@
   }
 
   // ---------- 智能补帧（作用于当前分组已选帧）----------
-  function applyInterp() {
+  // 异步：逐张生成中间帧并让出事件循环，避免大帧数/光流时卡死页面。
+  let interpToken = 0;
+  async function applyInterp() {
     const src = groupFrames(state.activeGroup).filter((f) => f.selected).map((f) => f.data);
     if (src.length < 2) { toast("当前分组至少需要 2 帧才能补帧", "error"); return; }
     const method = $("interpMethod") ? $("interpMethod").value : "linear";
     const mode = $("interpMode") ? $("interpMode").value : "mult";
     const mult = int($("interpMult").value);
     const target = int($("interpTarget").value);
-    const out = O.interpolateFrames(src, { method, mode, mult, target });
+    const token = ++interpToken;
+    const gen = O.interpolateFramesLazy(src, { method, mode, mult, target });
+    const out = [];
+    const yieldEvery = method === "linear" ? 64 : 12; // 光流/AI 更重，更频繁让出
+    showProgress("补帧中", 0);
+    let count = 0, base = src.length;
+    for (const d of gen) {
+      if (token !== interpToken) { showProgress(null, 0); return; } // 被新的补帧取消
+      out.push(d);
+      count++;
+      // 进度无法预知总数（target 已知），用已生成/估算总数显示
+      const est = mode === "target" ? clamp(target, base + 1, 600) : base + (base - 1) * (mult - 1);
+      if (count % yieldEvery === 0) {
+        showProgress("补帧中", est ? count / est : 0);
+        await new Promise((r) => setTimeout(r, 0)); // 让出主线程，保持可响应
+      }
+    }
     // 用插值结果替换当前分组（保留分组归属，全部选中）
     const gid = state.activeGroup;
     state.frames = state.frames.filter((f) => f.group !== gid);
@@ -336,12 +354,15 @@
     const info = O.analyzeSizes(groupFrames(gid));
     if (!info.uniform) applyAlignment(info.refIndex);
     renderFrames(); updateFrameCount();
+    showProgress(null, 0);
     toast(`补帧完成：当前分组 ${src.length} → ${out.length} 帧（${methodLabel(method)}）`);
   }
   const methodLabel = (m) => ({ linear: "线性混合", optical: "传统光流", ai: "AI 补帧(RIFE 近似)" }[m] || m);
 
   // ---------- GIF 生成引擎（针对当前分组）----------
-  function generateGif() {
+  // 异步：逐帧编码并在时间预算内让出主线程，更新进度条；用 token 取消过期生成。
+  let genToken = 0;
+  async function generateGif() {
     const outW = clamp(int($("outW").value), 8, MAX_DIM);
     const outH = clamp(int($("outH").value), 8, MAX_DIM);
     const fps = clamp(int($("fps").value), 1, 60);
@@ -353,6 +374,10 @@
     if (!selected.length) { toast("请至少选择一帧", "error"); return; }
     const delay = Math.max(2, Math.round(100 / fps));
 
+    // 取消上一次未完成的生成（实时预览/切分组触发）
+    const token = ++genToken;
+    showProgress("生成中", 0);
+
     // 确保同尺寸
     const info = O.analyzeSizes(selected);
     let framesData = selected.map((f) => f.data);
@@ -360,37 +385,60 @@
 
     const tc = document.createElement("canvas"); tc.width = outW; tc.height = outH;
     const tctx = tc.getContext("2d"); tctx.imageSmoothingEnabled = false;
+    const total = framesData.length;
 
-    const mkBuf = () => new Uint8Array(outW * outH * 3 * selected.length + 8192);
-    let buf = mkBuf(), gif, len;
+    const mkBuf = () => new Uint8Array(outW * outH * 3 * total + 8192);
+    let buf = mkBuf(), gif, len, allocScale = 3;
+    const addFrameSafe = (g, f) => {
+      const sc = document.createElement("canvas"); sc.width = f.width; sc.height = f.height;
+      sc.getContext("2d").putImageData(f, 0, 0);
+      tctx.clearRect(0, 0, outW, outH);
+      tctx.drawImage(sc, 0, 0, outW, outH);
+      const outData = tctx.getImageData(0, 0, outW, outH).data;
+      const { indices, opts } = O.quantizeFrame(outData, outW, outH, quality);
+      g.addFrame(0, 0, outW, outH, indices, Object.assign({ delay }, opts));
+    };
+
     try {
       gif = new GifWriter(buf, outW, outH, { loop: 0 });
+      let done = 0;
+      const BUDGET = 24; // ms：每帧后累计超过该预算就让出，防止页面无响应
+      let t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
       for (const f of framesData) {
-        const sc = document.createElement("canvas"); sc.width = f.width; sc.height = f.height;
-        sc.getContext("2d").putImageData(f, 0, 0);
-        tctx.clearRect(0, 0, outW, outH);
-        tctx.drawImage(sc, 0, 0, outW, outH);
-        const outData = tctx.getImageData(0, 0, outW, outH).data;
-        const { indices, opts } = O.quantizeFrame(outData, outW, outH, quality);
-        gif.addFrame(0, 0, outW, outH, indices, Object.assign({ delay }, opts));
+        if (token !== genToken) { showProgress(null, 0); return; } // 过期，丢弃
+        addFrameSafe(gif, f);
+        done++;
+        const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+        if (now - t0 >= BUDGET) {
+          showProgress("生成中", done / total);
+          await new Promise((r) => setTimeout(r, 0)); // 让出主线程
+          t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+        }
       }
       len = gif.end();
     } catch (e) {
       if (String(e).includes("buffer") || String(e).includes("range")) {
-        buf = new Uint8Array(outW * outH * 6 * selected.length + 16384);
+        allocScale = 6;
+        buf = new Uint8Array(outW * outH * allocScale * total + 16384);
         gif = new GifWriter(buf, outW, outH, { loop: 0 });
+        let done = 0;
+        let t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
         for (const f of framesData) {
-          const sc = document.createElement("canvas"); sc.width = f.width; sc.height = f.height;
-          sc.getContext("2d").putImageData(f, 0, 0);
-          tctx.clearRect(0, 0, outW, outH);
-          tctx.drawImage(sc, 0, 0, outW, outH);
-          const outData = tctx.getImageData(0, 0, outW, outH).data;
-          const { indices, opts } = O.quantizeFrame(outData, outW, outH, quality);
-          gif.addFrame(0, 0, outW, outH, indices, Object.assign({ delay }, opts));
+          if (token !== genToken) { showProgress(null, 0); return; }
+          addFrameSafe(gif, f);
+          done++;
+          const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          if (now - t0 >= BUDGET) {
+            showProgress("生成中", done / total);
+            await new Promise((r) => setTimeout(r, 0));
+            t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          }
         }
         len = gif.end();
       } else throw e;
     }
+
+    if (token !== genToken) { showProgress(null, 0); return; } // 编码后再次检查
 
     const blob = new Blob([buf.subarray(0, len)], { type: "image/gif" });
     if (state.resultUrl) URL.revokeObjectURL(state.resultUrl);
@@ -400,6 +448,7 @@
     const db = $("downloadBtn"); if (db) { db.href = state.resultUrl; db.classList.remove("hidden"); db.download = `pixel-${groupName(gid)}.gif`; }
     const gs = $("genStatus"); if (gs) gs.textContent =
       `已生成 ｜ ${selected.length} 帧 ｜ ${outW}×${outH} ｜ ${fps}fps ｜ 画质 ${quality} 色 ｜ ${(blob.size / 1024).toFixed(1)}KB`;
+    showProgress(null, 0);
   }
 
   // 预览窗口自适应 GIF 实际尺寸（上限封顶）
@@ -411,24 +460,36 @@
     if (rp) { rp.style.width = w + "px"; rp.style.height = h + "px"; }
   }
 
+  // 进度条（null 表示隐藏）
+  function showProgress(label, ratio) {
+    const wrap = $("progress"), bar = $("progressBar"), lab = $("progressLabel");
+    if (!wrap) return;
+    if (label == null) { wrap.classList.add("hidden"); return; }
+    wrap.classList.remove("hidden");
+    if (bar) bar.style.width = Math.max(0, Math.min(100, Math.round(ratio * 100))) + "%";
+    if (lab) lab.textContent = `${label} ｜ ${Math.round(ratio * 100)}%`;
+  }
+
   // 导出所有分组（逐个生成并触发下载）
-  function exportAll() {
+  async function exportAll() {
     const boxes = document.querySelectorAll(".group-chip");
     let any = false;
-    state.groups.forEach((g) => {
+    for (const g of state.groups) {
       const fs = groupFrames(g.id).filter((f) => f.selected);
-      if (!fs.length) return;
+      if (!fs.length) continue;
       any = true;
       state.activeGroup = g.id;
       const sel = $("groupSelect"); if (sel) sel.value = String(g.id);
-      generateGif();
+      const urlPrev = state.resultUrl;
+      await generateGif();
       const url = state.resultUrl;
-      if (url) {
+      if (url && url !== urlPrev) {
         const a = document.createElement("a");
         a.href = url; a.download = `pixel-${g.name}.gif`;
         document.body.appendChild(a); a.click(); a.remove();
       }
-    });
+      await new Promise((r) => setTimeout(r, 0)); // 让出一帧，避免连续下载卡顿
+    }
     if (!any) toast("没有可导出的分组", "error");
     else toast("已导出全部分组 GIF");
   }
