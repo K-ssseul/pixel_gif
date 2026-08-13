@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>像素风 GIF 生成器</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1>🎮 像素风 GIF 生成器</h1>
+    <p class="subtitle">上传精灵表 / 序列帧 → 自动识别·切图·抠图·分组·补帧 → 一键导出 GIF（全程本地处理，文件不上传）</p>
+  </header>
+
+  <!-- 步骤条 -->
+  <nav class="stepper" id="stepper">
+    <button class="step active" data-step="1">
+      <span class="step-no">1</span><span class="step-name">上传素材</span>
+    </button>
+    <button class="step" data-step="2" disabled>
+      <span class="step-no">2</span><span class="step-name">切图 / 选帧 / 分组</span>
+    </button>
+    <button class="step" data-step="3" disabled>
+      <span class="step-no">3</span><span class="step-name">生成 / 下载</span>
+    </button>
+  </nav>
+
+  <main class="stage">
+    <!-- 步骤 1：上传 -->
+    <section class="panel" id="panel-1">
+      <div class="upload-zone" id="uploadZone">
+        <input type="file" id="fileInput" accept="image/jpeg,image/png,image/gif" hidden />
+        <div class="upload-inner">
+          <div class="upload-icon">📂</div>
+          <p class="upload-title">点击或拖拽图片到此处</p>
+          <p class="upload-hint">支持 JPG / PNG / GIF ｜ 单文件 ≤ 10MB ｜ 自动识别帧 / 自动抠背景</p>
+        </div>
+      </div>
+      <div class="source-preview hidden" id="sourcePreview">
+        <h3>源文件预览</h3>
+        <canvas id="sourceCanvas" class="source-canvas"></canvas>
+        <p class="meta" id="sourceMeta"></p>
+        <button class="btn btn-ghost" id="reuploadBtn">重新上传</button>
+      </div>
+    </section>
+
+    <!-- 步骤 2：切图 + 选帧 + 分组 + 补帧 -->
+    <section class="panel hidden" id="panel-2">
+      <div class="control-row">
+        <div class="control-group">
+          <label>切图模式</label>
+          <select id="sliceMode">
+            <option value="auto" selected>自动检测</option>
+            <option value="grid">均匀网格</option>
+            <option value="transparent">透明切割</option>
+          </select>
+        </div>
+        <div class="control-group hidden" id="gridParams">
+          <label>列数 (Cols)</label>
+          <input type="number" id="cols" min="1" max="64" value="4" />
+          <label>行数 (Rows)</label>
+          <input type="number" id="rows" min="1" max="64" value="4" />
+        </div>
+        <div class="control-group hidden" id="transparentParams">
+          <label>容差 (0-255)</label>
+          <input type="number" id="tolerance" min="0" max="255" value="10" />
+        </div>
+        <div class="control-group hidden" id="autoParams">
+          <label>自动检测说明</label>
+          <span class="meta">按透明缝隙自动切分为网格；无透明则整图作为 1 帧</span>
+        </div>
+        <div class="control-group">
+          <label>像素块大小</label>
+          <input type="number" id="pixelSize" min="1" max="64" value="8" />
+        </div>
+        <div class="control-group">
+          <label><input type="checkbox" id="autoBg" checked /> 自动抠背景</label>
+          <label>抠图容差 (1-255)</label>
+          <input type="number" id="bgTolerance" min="1" max="255" value="40" />
+        </div>
+        <button class="btn btn-primary" id="applySlice">应用切图 / 像素化</button>
+      </div>
+
+      <!-- 分组管理 -->
+      <div class="group-manage">
+        <h3>帧分组（每组 = 一个 GIF）</h3>
+        <div class="group-bar" id="groupBar"></div>
+        <div class="group-ops">
+          <button class="btn btn-mini" id="newGroupBtn">＋ 新建分组</button>
+          <button class="btn btn-mini" id="delGroupBtn">删除当前分组</button>
+          <button class="btn btn-mini" id="selectAll">全选(当前组)</button>
+          <button class="btn btn-mini" id="selectNone">全不选(当前组)</button>
+        </div>
+      </div>
+
+      <!-- 智能补帧 -->
+      <div class="interp-box">
+        <h3>智能补帧（作用于当前分组已选帧）</h3>
+        <div class="control-row">
+          <div class="control-group">
+            <label>补帧算法</label>
+            <select id="interpMethod">
+              <option value="linear">线性混合（快，适合小幅运动）</option>
+              <option value="optical">传统光流（块匹配，运动更顺滑）</option>
+              <option value="ai">AI 补帧（RIFE 近似，双向光流精修）</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label>补帧方式</label>
+            <select id="interpMode">
+              <option value="mult">倍率补帧（×N）</option>
+              <option value="target">目标帧数（指定总数）</option>
+            </select>
+          </div>
+          <div class="control-group">
+            <label>倍率 (2-16)</label>
+            <input type="number" id="interpMult" min="2" max="16" value="2" />
+          </div>
+          <div class="control-group">
+            <label>目标帧数</label>
+            <input type="number" id="interpTarget" min="3" max="600" value="12" />
+          </div>
+          <button class="btn btn-primary" id="applyInterp">应用补帧</button>
+        </div>
+        <p class="meta interp-help">
+          说明：① 倍率补帧＝在每两帧之间插入 N-1 张中间帧；② 目标帧数＝把整段动画均匀扩展到指定总帧数；
+          ③ 线性混合＝前后帧直接插值（简单）；④ 传统光流＝逐块估计运动并 warp，适合位移较大的动作；
+          ⑤ AI 补帧(RIFE 近似)＝双向光流 + 精修，效果更接近 AI，真·RIFE 模型需额外加载 ONNX（本工具用近似实现，离线可用）。
+        </p>
+      </div>
+
+      <div class="frames-area">
+        <h3>帧列表（点击勾选参与 GIF；下拉框可改所属分组）</h3>
+        <div class="frames-toolbar">
+          <span class="meta" id="frameCount"></span>
+        </div>
+        <div class="frames-grid" id="framesGrid"></div>
+      </div>
+    </section>
+
+    <!-- 步骤 3：生成 + 下载 -->
+    <section class="panel hidden" id="panel-3">
+      <div class="control-row">
+        <div class="control-group">
+          <label>输出分组</label>
+          <select id="groupSelect"></select>
+        </div>
+        <div class="control-group">
+          <label>输出宽度 (px, ≤500)</label>
+          <input type="number" id="outW" min="8" max="500" value="128" />
+        </div>
+        <div class="control-group">
+          <label>输出高度 (px, ≤500)</label>
+          <input type="number" id="outH" min="8" max="500" value="128" />
+        </div>
+        <div class="control-group">
+          <label>帧率 (FPS)</label>
+          <input type="number" id="fps" min="1" max="60" value="10" />
+        </div>
+        <div class="control-group">
+          <label>画质（颜色数 2-256，2 的幂）</label>
+          <select id="quality">
+            <option value="32">32 色</option>
+            <option value="64">64 色</option>
+            <option value="128">128 色</option>
+            <option value="256" selected>256 色（原图级）</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" id="generateBtn">生成 GIF</button>
+        <button class="btn btn-mini" id="exportAllBtn">导出全部分组</button>
+      </div>
+
+      <div class="result-area">
+        <div class="result-block">
+          <h3>实时预览（窗口自适应 GIF 尺寸）</h3>
+          <div class="preview-box" id="previewBox">
+            <img id="resultPreview" alt="GIF 预览" />
+          </div>
+        </div>
+        <div class="result-block">
+          <h3>状态</h3>
+          <p class="meta" id="genStatus">尚未生成</p>
+          <a class="btn btn-download hidden" id="downloadBtn" download="pixel-art.gif">⬇️ 一键下载</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 对齐弹窗 -->
+  <div class="modal hidden" id="alignModal">
+    <div class="modal-box">
+      <h3>帧尺寸不一致，请选择基准帧</h3>
+      <p class="meta" id="alignNote"></p>
+      <div class="align-list" id="alignList"></div>
+      <div class="modal-actions">
+        <button class="btn" id="alignCancel">取消</button>
+        <button class="btn btn-primary" id="alignConfirm">应用对齐</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="js/lib/omggif.js"></script>
+  <script src="js/lib/pixel-ops.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
