@@ -465,10 +465,47 @@
     return Promise.resolve(quantizeFrame(rgba, w, h, maxColors));
   }
 
+  // ---------- 全局调色板（跨所有帧共享，消除帧间色彩抖动 / 重影）----------
+  // 返回 { palArr(打包0xRRGGBB), paletteRGB([[r,g,b]...]), transIndex, nColors, L }
+  // hasTrans=true 时调色板长度 = L(2 的幂)，其中前 L-1 为颜色、最后 1 个为透明索引。
+  function buildGlobalPalette(samples, maxColors, hasTrans) {
+    let L = clamp(maxColors, 2, 256);
+    L = 1 << Math.ceil(Math.log2(L));
+    if (L < 2) L = 2; if (L > 256) L = 256;
+    const nColors = hasTrans ? L - 1 : L;
+    const sampled = samples && samples.length ? samples : [[0, 0, 0]];
+    let palette = medianCut(sampled, nColors);
+    while (palette.length < nColors) palette.push(palette[palette.length - 1] || [0, 0, 0]);
+    let transIndex = -1;
+    if (hasTrans) { palette.push([0, 0, 0]); transIndex = palette.length - 1; }
+    const palArr = [];
+    for (let i = 0; i < palette.length; i++) palArr.push(((palette[i][0] | 0) << 16) | ((palette[i][1] | 0) << 8) | (palette[i][2] | 0));
+    return { palArr, paletteRGB: palette, transIndex, nColors, L };
+  }
+
+  // 将单帧 RGBA 映射到全局调色板索引（透明像素 → transIndex）。返回 Uint8Array。
+  function mapFrameToPalette(rgba, w, h, paletteRGB, nColors, transIndex, hasTrans) {
+    const total = w * h;
+    const indices = new Uint8Array(total);
+    for (let i = 0; i < total; i++) {
+      if (hasTrans && rgba[i * 4 + 3] < 128) { indices[i] = transIndex; continue; }
+      const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+      let best = 0, bd = Infinity;
+      for (let k = 0; k < nColors; k++) {
+        const dr = r - paletteRGB[k][0], dg = g - paletteRGB[k][1], db = b - paletteRGB[k][2];
+        const dd = dr * dr + dg * dg + db * db;
+        if (dd < bd) { bd = dd; best = k; }
+      }
+      indices[i] = best;
+    }
+    return indices;
+  }
+
   return {
     clamp, int, Img, pixelate, sliceGrid, sliceTransparent, autoDetectGrid,
     removeBackground, fitFrameTo, analyzeSizes, alignToReference,
     blendFrames, opticalFlowWarp, interpolateFrames, interpolateFramesLazy,
     medianCut, quantizeFrame, quantizeFrameAsync,
+    buildGlobalPalette, mapFrameToPalette,
   };
 });

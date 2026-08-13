@@ -154,8 +154,8 @@
           <input type="number" id="outH" min="8" max="500" value="128" />
         </div>
         <div class="control-group">
-          <label>帧率 (FPS)</label>
-          <input type="number" id="fps" min="1" max="60" value="10" />
+          <label>帧间隔 (ms，20–1000)</label>
+          <input type="number" id="frameDelay" min="20" max="1000" step="10" value="100" />
         </div>
         <div class="control-group">
           <label>画质（颜色数 2-256，2 的幂）</label>
@@ -172,9 +172,22 @@
 
       <div class="result-area">
         <div class="result-block">
-          <h3>实时预览（窗口自适应 GIF 尺寸）</h3>
+          <h3>实时预览（窗口自适应 ｜ 拖动滑块即时调节帧间隔）</h3>
           <div class="preview-box" id="previewBox">
-            <img id="resultPreview" alt="GIF 预览" />
+            <canvas id="livePreview" class="live-preview"></canvas>
+          </div>
+          <div class="preview-controls">
+            <div class="control-group" style="flex:1; min-width:220px;">
+              <label>帧间隔：<span id="frameDelayVal">100</span> ms <span class="muted" id="frameDelayFps">（≈10 fps）</span></label>
+              <input type="range" id="frameDelayRange" min="20" max="1000" step="10" value="100" />
+            </div>
+            <div class="frame-pos">帧 <span id="liveFramePos">0</span> / <span id="liveFrameTotal">0</span></div>
+          </div>
+        </div>
+        <div class="result-block">
+          <h3>GIF 输出预览（点击「生成 GIF」后显示，含最终画质与透明）</h3>
+          <div class="preview-box" id="outPreviewBox">
+            <img id="resultPreview" alt="GIF 输出预览" />
           </div>
         </div>
         <div class="progress hidden" id="progress">

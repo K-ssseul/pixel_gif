@@ -131,5 +131,50 @@ try {
   ok("往返：透明像素保留", transparentOk);
 }
 
+// 10) 重影修复：透明孔洞帧在 dispose:2 下不应残留上一帧颜色
+{
+  const W = 16, H = 16;
+  // 帧1：全红不透明
+  const f1 = mk(W, H, () => [220, 40, 40, 255]);
+  // 帧2：红底 + 中心 4x4 透明孔洞
+  const f2 = mk(W, H, (x, y) => ((x >= 6 && x < 10 && y >= 6 && y < 10) ? [0, 0, 0, 0] : [220, 40, 40, 255]));
+  const samples = [];
+  for (const f of [f1, f2]) {
+    const d = f.data;
+    for (let i = 0; i < d.length; i += 4) if (d[i + 3] >= 128) samples.push([d[i], d[i + 1], d[i + 2]]);
+  }
+  const gp = O.buildGlobalPalette(samples, 64, true);
+  const buf = new Uint8Array(W * H * 3 * 2 + 8192);
+  const gif = new GifWriter(buf, W, H, { loop: 0, palette: gp.palArr, background: gp.transIndex });
+  for (const f of [f1, f2]) {
+    const idx = O.mapFrameToPalette(f.data, W, H, gp.paletteRGB, gp.nColors, gp.transIndex, true);
+    gif.addFrame(0, 0, W, H, idx, { delay: 10, transparent: gp.transIndex, disposal: 2 });
+  }
+  const len = gif.end();
+  const r = new GifReader(buf.subarray(0, len));
+  ok("重影测试：全局调色板长度=64", gp.palArr.length === 64);
+  ok("重影测试：transIndex = 63", gp.transIndex === 63);
+
+  // 解码并按 dispose 合成（与 app.js decodeGif 一致；omggif 需顺序解码并累加进 full）
+  const full = new Uint8ClampedArray(W * H * 4);
+  let prevDisposal = 0, prevRect = null;
+  for (let f = 0; f < r.numFrames(); f++) {
+    const info = r.frameInfo(f);
+    if (prevRect && prevDisposal === 2) {
+      for (let y = prevRect.top; y < prevRect.top + prevRect.height; y++)
+        for (let x = prevRect.left; x < prevRect.left + prevRect.width; x++) {
+          const i = (y * W + x) * 4; full[i] = full[i + 1] = full[i + 2] = full[i + 3] = 0;
+        }
+    }
+    r.decodeAndBlitFrameRGBA(f, full); // 顺序解码，累加进 full；透明索引像素自动跳过
+    prevDisposal = info.disposal; prevRect = { left: info.x, top: info.y, width: info.width, height: info.height };
+  }
+  const hi = ((8 * W) + 8) * 4; // 孔洞中心
+  const holeAlpha = full[hi + 3];
+  ok("重影测试：帧2 孔洞解码为透明（无重影）", holeAlpha === 0);
+  // 对照：若用 dispose:0（旧逻辑）会残留红色——此处确认透明，即修复生效
+  ok("重影测试：孔洞周围仍保留红色", full[(3 * W + 3) * 4 + 3] === 255 && full[(3 * W + 3) * 4] > 180);
+}
+
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

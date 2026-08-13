@@ -248,6 +248,27 @@ body {
   image-rendering: crisp-edges;
   max-width: 480px; max-height: 480px;
 }
+.preview-box canvas {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  background: transparent;
+}
+/* 实时预览控制条 */
+.preview-controls {
+  display: flex; align-items: center; gap: 18px; margin-top: 14px; flex-wrap: wrap;
+}
+.preview-controls .control-group { gap: 6px; }
+.preview-controls input[type="range"] {
+  width: 100%; accent-color: var(--accent); cursor: pointer; height: 6px;
+}
+.preview-controls label { font-size: 13px; color: var(--text); }
+.preview-controls .muted { color: var(--muted); font-size: 12px; }
+.frame-pos {
+  font-size: 13px; color: var(--muted); white-space: nowrap;
+  padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-2);
+}
+.frame-pos span { color: var(--text); font-weight: 700; }
 .meta { color: var(--muted); font-size: 13px; }
 
 /* Toast */

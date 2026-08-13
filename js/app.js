@@ -317,7 +317,7 @@
   function onActiveGroupChange() {
     const fs = groupFrames(state.activeGroup);
     if (fs.length) { const info = O.analyzeSizes(fs); setDefaultDims(info.refIndex); }
-    if (state.step === 3) generateGif();
+    if (state.step === 3) { generateGif(); startLivePreview(); }
   }
 
   // ---------- 智能补帧（作用于当前分组已选帧）----------
@@ -361,21 +361,21 @@
 
   // ---------- GIF 生成引擎（针对当前分组）----------
   // 异步：逐帧编码并在时间预算内让出主线程，更新进度条；用 token 取消过期生成。
+  // 重影修复：使用全局调色板 + dispose:2（透明区域还原为背景/透明），避免前后帧叠加。
   let genToken = 0;
   async function generateGif() {
     const outW = clamp(int($("outW").value), 8, MAX_DIM);
     const outH = clamp(int($("outH").value), 8, MAX_DIM);
-    const fps = clamp(int($("fps").value), 1, 60);
+    const frameDelayMs = clamp(int($("frameDelay").value), 20, 2000);
+    const delayCs = Math.max(2, Math.round(frameDelayMs / 10)); // omggif 单位为 1/100 秒
     const quality = int($("quality").value);
     const gid = int(($("groupSelect") && $("groupSelect").value) || state.activeGroup);
     state.activeGroup = gid;
     const groupFs = groupFrames(gid);
     const selected = groupFs.filter((f) => f.selected);
     if (!selected.length) { toast("请至少选择一帧", "error"); return; }
-    const delay = Math.max(2, Math.round(100 / fps));
 
-    // 取消上一次未完成的生成（实时预览/切分组触发）
-    const token = ++genToken;
+    const token = ++genToken; // 取消上一次未完成的生成（实时预览/切分组触发）
     showProgress("生成中", 0);
 
     // 确保同尺寸
@@ -387,54 +387,66 @@
     const tctx = tc.getContext("2d"); tctx.imageSmoothingEnabled = false;
     const total = framesData.length;
 
-    const mkBuf = () => new Uint8Array(outW * outH * 3 * total + 8192);
-    let buf = mkBuf(), gif, len, allocScale = 3;
-    const addFrameSafe = (g, f) => {
+    // 第一遍：把每帧缩放到输出尺寸，并采集不透明像素用于全局调色板，同时判定是否含透明
+    const scaled = [];
+    const samples = [];
+    let hasTrans = false;
+    const sampleStride = Math.max(1, Math.floor((outW * outH * total) / 30000));
+    let scnt = 0;
+    for (const f of framesData) {
       const sc = document.createElement("canvas"); sc.width = f.width; sc.height = f.height;
       sc.getContext("2d").putImageData(f, 0, 0);
       tctx.clearRect(0, 0, outW, outH);
       tctx.drawImage(sc, 0, 0, outW, outH);
-      const outData = tctx.getImageData(0, 0, outW, outH).data;
-      const { indices, opts } = O.quantizeFrame(outData, outW, outH, quality);
-      g.addFrame(0, 0, outW, outH, indices, Object.assign({ delay }, opts));
-    };
+      const od = tctx.getImageData(0, 0, outW, outH).data;
+      scaled.push(od);
+      for (let i = 0; i < od.length; i += 4) {
+        if (od[i + 3] < 128) { hasTrans = true; continue; }
+        if ((scnt++ % sampleStride) === 0) samples.push([od[i], od[i + 1], od[i + 2]]);
+      }
+    }
 
-    try {
-      gif = new GifWriter(buf, outW, outH, { loop: 0 });
+    // 构建全局调色板
+    const gp = O.buildGlobalPalette(samples, quality, hasTrans);
+
+    const mkBuf = () => new Uint8Array(outW * outH * 3 * total + 8192);
+    let buf = mkBuf(), gif, len;
+    const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
+    const encodeAll = async () => {
+      gif = new GifWriter(buf, outW, outH, hasTrans
+        ? { loop: 0, palette: gp.palArr, background: gp.transIndex }
+        : { loop: 0, palette: gp.palArr });
       let done = 0;
       const BUDGET = 24; // ms：每帧后累计超过该预算就让出，防止页面无响应
-      let t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-      for (const f of framesData) {
-        if (token !== genToken) { showProgress(null, 0); return; } // 过期，丢弃
-        addFrameSafe(gif, f);
+      let t0 = now();
+      for (let k = 0; k < scaled.length; k++) {
+        if (token !== genToken) { showProgress(null, 0); return false; } // 过期，丢弃
+        const indices = O.mapFrameToPalette(scaled[k], outW, outH, gp.paletteRGB, gp.nColors, gp.transIndex, hasTrans);
+        gif.addFrame(0, 0, outW, outH, indices, {
+          delay: delayCs,
+          transparent: hasTrans ? gp.transIndex : undefined,
+          disposal: hasTrans ? 2 : 1, // 透明帧：还原背景，消除重影（omggif 选项名为 disposal）
+        });
         done++;
-        const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
-        if (now - t0 >= BUDGET) {
+        if (now() - t0 >= BUDGET) {
           showProgress("生成中", done / total);
           await new Promise((r) => setTimeout(r, 0)); // 让出主线程
-          t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          t0 = now();
         }
       }
       len = gif.end();
+      return true;
+    };
+
+    try {
+      const ok = await encodeAll();
+      if (!ok) return;
     } catch (e) {
       if (String(e).includes("buffer") || String(e).includes("range")) {
-        allocScale = 6;
-        buf = new Uint8Array(outW * outH * allocScale * total + 16384);
-        gif = new GifWriter(buf, outW, outH, { loop: 0 });
-        let done = 0;
-        let t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-        for (const f of framesData) {
-          if (token !== genToken) { showProgress(null, 0); return; }
-          addFrameSafe(gif, f);
-          done++;
-          const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
-          if (now - t0 >= BUDGET) {
-            showProgress("生成中", done / total);
-            await new Promise((r) => setTimeout(r, 0));
-            t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-          }
-        }
-        len = gif.end();
+        buf = new Uint8Array(outW * outH * 6 * total + 16384);
+        const ok = await encodeAll();
+        if (!ok) return;
       } else throw e;
     }
 
@@ -447,17 +459,67 @@
     const rp = $("resultPreview"); if (rp) { rp.src = state.resultUrl; fitPreview(outW, outH); }
     const db = $("downloadBtn"); if (db) { db.href = state.resultUrl; db.classList.remove("hidden"); db.download = `pixel-${groupName(gid)}.gif`; }
     const gs = $("genStatus"); if (gs) gs.textContent =
-      `已生成 ｜ ${selected.length} 帧 ｜ ${outW}×${outH} ｜ ${fps}fps ｜ 画质 ${quality} 色 ｜ ${(blob.size / 1024).toFixed(1)}KB`;
+      `已生成 ｜ ${selected.length} 帧 ｜ ${outW}×${outH} ｜ 帧间隔 ${frameDelayMs}ms（≈${Math.round(1000 / frameDelayMs)}fps）｜ 画质 ${quality} 色 ｜ ${(blob.size / 1024).toFixed(1)}KB`;
     showProgress(null, 0);
   }
 
-  // 预览窗口自适应 GIF 实际尺寸（上限封顶）
+  // 预览窗口自适应 GIF 实际尺寸（像素级清晰，上限封顶）
   function fitPreview(w, h) {
-    const box = $("previewBox");
-    if (!box) return;
-    box.style.width = "auto"; box.style.height = "auto";
+    const disp = Math.max(1, Math.min(480 / w, 480 / h));
     const rp = $("resultPreview");
-    if (rp) { rp.style.width = w + "px"; rp.style.height = h + "px"; }
+    if (rp) { rp.style.width = (w * disp) + "px"; rp.style.height = (h * disp) + "px"; }
+  }
+
+  // ---------- 实时预览播放器（不重新编码，直接按帧间隔循环播放选中帧）----------
+  let liveTimer = null, liveIdx = 0, liveFrames = [], liveCanvas = null, liveCtx = null;
+  const getFrameDelayMs = () => clamp(int($("frameDelay").value), 20, 2000);
+  function ensureLiveCanvas() {
+    if (!liveCanvas) { liveCanvas = $("livePreview"); liveCtx = liveCanvas ? liveCanvas.getContext("2d") : null; }
+  }
+  function reportLivePos() {
+    const pos = $("liveFramePos"), tot = $("liveFrameTotal");
+    if (pos) pos.textContent = liveFrames.length ? String(liveIdx + 1) : "0";
+    if (tot) tot.textContent = String(liveFrames.length);
+  }
+  function drawLiveFrame() {
+    if (!liveCtx || !liveFrames.length) { reportLivePos(); return; }
+    const f = liveFrames[liveIdx];
+    const sc = document.createElement("canvas"); sc.width = f.width; sc.height = f.height;
+    sc.getContext("2d").putImageData(f, 0, 0);
+    liveCtx.imageSmoothingEnabled = false;
+    liveCtx.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+    liveCtx.drawImage(sc, 0, 0, liveCanvas.width, liveCanvas.height); // 拉伸到输出尺寸，与导出一致
+    reportLivePos();
+    liveTimer = setTimeout(liveTick, getFrameDelayMs()); // 下一帧：读取当前帧间隔
+  }
+  function liveTick() {
+    if (!liveFrames.length) { liveTimer = null; return; }
+    liveIdx = (liveIdx + 1) % liveFrames.length;
+    drawLiveFrame();
+  }
+  function stopLivePreview() { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } }
+  // 重新采集选中帧并（从首帧）开始播放；改尺寸/分组/帧选择时调用
+  function startLivePreview() {
+    ensureLiveCanvas();
+    if (!liveCanvas) return;
+    updateFrameDelayLabel();
+    stopLivePreview();
+    liveFrames = groupFrames(state.activeGroup).filter((f) => f.selected);
+    const outW = clamp(int($("outW").value), 8, MAX_DIM);
+    const outH = clamp(int($("outH").value), 8, MAX_DIM);
+    liveCanvas.width = outW; liveCanvas.height = outH;
+    const disp = Math.max(1, Math.min(480 / outW, 480 / outH));
+    liveCanvas.style.width = (outW * disp) + "px";
+    liveCanvas.style.height = (outH * disp) + "px";
+    liveIdx = 0;
+    if (!liveFrames.length) { liveCtx.clearRect(0, 0, outW, outH); reportLivePos(); return; }
+    drawLiveFrame();
+  }
+  // 仅更新帧间隔显示（不重置播放），拖动滑块即时反映节奏
+  function updateFrameDelayLabel() {
+    const ms = getFrameDelayMs();
+    const v = $("frameDelayVal"); if (v) v.textContent = String(ms);
+    const fps = $("frameDelayFps"); if (fps) fps.textContent = `（≈${Math.round(1000 / ms)} fps）`;
   }
 
   // 进度条（null 表示隐藏）
@@ -521,7 +583,7 @@
     toStep3.onclick = () => {
       const sel = groupFrames(state.activeGroup).filter((f) => f.selected).length;
       if (!sel) { toast("请至少选择一帧", "error"); return; }
-      goStep(3); generateGif();
+      goStep(3); generateGif(); startLivePreview();
     };
     const tb = document.querySelector("#panel-2 .frames-toolbar"); if (tb) tb.appendChild(toStep3);
 
@@ -531,11 +593,22 @@
     const ai = $("applyInterp"); if (ai) ai.onclick = applyInterp;
     const gs = $("groupSelect"); if (gs) gs.onchange = () => { state.activeGroup = int(gs.value); renderFrames(); updateFrameCount(); onActiveGroupChange(); };
 
-    // 步骤 3 实时预览（防抖）
+    // 步骤 3 实时预览（防抖）：改尺寸/画质 → 重新生成 + 重开实时预览
     let dt = null;
-    const debounced = () => { clearTimeout(dt); dt = setTimeout(generateGif, 350); };
-    ["outW", "outH", "fps", "quality"].forEach((id) => { const elx = $(id); if (elx) { elx.addEventListener("input", debounced); elx.addEventListener("change", generateGif); } });
-    const gb = $("generateBtn"); if (gb) gb.onclick = generateGif;
+    const debounced = () => { clearTimeout(dt); dt = setTimeout(() => { generateGif(); startLivePreview(); }, 350); };
+    ["outW", "outH", "quality"].forEach((id) => {
+      const elx = $(id);
+      if (!elx) return;
+      elx.addEventListener("input", debounced);
+      elx.addEventListener("change", () => { generateGif(); startLivePreview(); });
+    });
+    // 帧间隔：数字框与滑块双向同步，拖动即时改变播放节奏（不重置播放）
+    const fdNum = $("frameDelay"), fdRng = $("frameDelayRange");
+    const syncDelayFromNum = () => { if (fdNum && fdRng) fdRng.value = fdNum.value; updateFrameDelayLabel(); };
+    const syncDelayFromRng = () => { if (fdNum && fdRng) fdNum.value = fdRng.value; updateFrameDelayLabel(); };
+    if (fdNum) { fdNum.addEventListener("input", syncDelayFromNum); fdNum.addEventListener("change", syncDelayFromNum); }
+    if (fdRng) { fdRng.addEventListener("input", syncDelayFromRng); fdRng.addEventListener("change", syncDelayFromRng); }
+    const gb = $("generateBtn"); if (gb) gb.onclick = () => { generateGif(); startLivePreview(); };
     const ea = $("exportAllBtn"); if (ea) ea.onclick = exportAll;
 
     // 对齐弹窗
